@@ -79,6 +79,7 @@ def build_po_line_csv(resumen: pd.DataFrame, *, customer_code: str, po_no: str,
         row["PO Status"] = "Abierta"
         row["PO Type"] = "Cantidad Cerrada"
         row["Terms"] = terms
+        row["Freight Terms"] = "Default"
         row["Approved Ship To"] = approved_ship_to
         row["Customer Part No"] = _customer_part_no(r["PT"])
         row["Part No"] = r["PT"]
