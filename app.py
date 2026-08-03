@@ -111,26 +111,59 @@ if missing_cols:
     )
     st.stop()
 
-sap_df["Material Number"] = sap_df["Material Number"].astype(str).str.strip()
+def _clean_material_number(x) -> str:
+    """SAP a veces exporta Material Number como número (float), lo que deja
+    un '.0' pegado al convertir a texto (21071507690.0). Lo limpiamos para
+    que siempre coincida con lo guardado en el Cross Reference."""
+    s = str(x).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
 
+
+# Algunos exports de SAP/Excel arrastran una fila extra de "Gran Total" al
+# final (residuo de una pivot table), con Material Number vacío pero
+# cantidades reales. Si no se filtra ANTES de convertir a texto, ese vacío
+# se vuelve el texto "nan" y se cuenta como si fuera un material más,
+# duplicando el total. Se elimina aquí, antes de cualquier otra cosa.
+filas_sin_material = sap_df["Material Number"].isna().sum()
+if filas_sin_material:
+    st.warning(
+        f"Se ignoraron {filas_sin_material} fila(s) sin Material Number "
+        "(probablemente una fila de 'Gran Total' que quedó pegada al "
+        "exportar el archivo). Verifica que no debieran tener datos válidos."
+    )
+    sap_df = sap_df[sap_df["Material Number"].notna()].copy()
+
+sap_df["Material Number"] = sap_df["Material Number"].apply(_clean_material_number)
+
+# Se agrupa SOLO por Material Number (igual que la pivot table original de
+# SAP) — nunca por Material Number + Descripción. Si el mismo Material
+# Number aparece con más de una descripción (pasa con algunos materiales
+# reales), las cantidades se SUMAN todas; solo se usa la primera
+# descripción encontrada como referencia visual, nunca se descarta cantidad.
 grouped = (
-    sap_df.groupby(["Material Number", "Material Description"], as_index=False)
+    sap_df.groupby("Material Number", as_index=False)
     .agg(
+        **{"Material Description": ("Material Description", "first")},
         Quantity=("Quantity", "sum"),
         Single_Side=("Single Side", "sum"),
         Double_Side=("Double Side", "sum"),
     )
 )
 
-# Un mismo Material Number no debería tener más de una descripción; si la
-# tiene, nos quedamos con la primera y avisamos.
-dup_materials = grouped["Material Number"].duplicated(keep=False)
-if dup_materials.any():
+dup_check = (
+    sap_df.groupby("Material Number")["Material Description"].nunique()
+)
+materiales_con_varias_desc = dup_check[dup_check > 1]
+if not materiales_con_varias_desc.empty:
     st.warning(
-        "Algunos Material Number aparecen con más de una descripción en el "
-        "reporte. Se usó la primera encontrada para clasificar."
+        f"{len(materiales_con_varias_desc)} Material Number aparecen con más "
+        "de una descripción en el reporte. Se sumaron todas sus cantidades "
+        "igual; se usó la primera descripción encontrada solo para "
+        "clasificar (revisa el detalle por SKU si quieres confirmar que la "
+        "forma/línea sea la correcta para todos los casos)."
     )
-    grouped = grouped.drop_duplicates(subset="Material Number", keep="first")
 
 # ---------------------------------------------------------------------------
 # Paso 3 — Clasificar contra el Cross Reference (o regla automática)
@@ -235,11 +268,28 @@ detalle_df["PT Double (-2)"] = detalle_df.apply(
 # Cada material aporta a dos categorías (single/double), salvo Bucket que
 # solo aporta a una (single). Armamos una tabla larga para sumar fácil.
 aportes = []
+anomalias_bucket = []
 for _, r in detalle_df.iterrows():
     if r["Qty Single Side"]:
         aportes.append({"PT": r["PT Single (-1)"], "Qty": r["Qty Single Side"]})
     if r["Forma"] != "BUCKET" and r["Qty Double Side"]:
         aportes.append({"PT": r["PT Double (-2)"], "Qty": r["Qty Double Side"]})
+    elif r["Forma"] == "BUCKET" and r["Qty Double Side"]:
+        # Bucket no tiene versión de doble logo: esta cantidad no entra a
+        # ninguna de las 10 categorías. Se avisa en vez de perderla en
+        # silencio (igual habría pasado con el VLOOKUP del proceso manual).
+        anomalias_bucket.append((r["Material Number"], r["Descripción"], r["Qty Double Side"]))
+
+if anomalias_bucket:
+    detalle_anom = "; ".join(
+        f"{mat} ({desc}): {qty} en Double Side" for mat, desc, qty in anomalias_bucket
+    )
+    st.warning(
+        "⚠️ Algunos materiales clasificados como BUCKET tienen cantidad en "
+        "'Double Side', pero Bucket no tiene versión de doble logo — esa "
+        f"cantidad NO se incluyó en ninguna categoría: {detalle_anom}. "
+        "Revisa si es un error de captura en SAP."
+    )
 
 aportes_df = pd.DataFrame(aportes, columns=["PT", "Qty"])
 resumen = (
